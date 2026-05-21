@@ -2,6 +2,7 @@
 
 import time
 from collections import defaultdict
+from numbers import Real
 from typing import Dict, List
 from threading import Lock
 
@@ -19,6 +20,9 @@ class MetricsCollector:
             self._counters[metric] += value
 
     def gauge(self, metric: str, value: float) -> None:
+        if not isinstance(value, Real) or isinstance(value, bool):
+            raise TypeError(f"Gauge value for {metric!r} must be numeric")
+
         with self._lock:
             self._gauges[metric] = value
 
@@ -32,11 +36,14 @@ class MetricsCollector:
 
     def stop_timer(self, metric: str) -> float:
         with self._lock:
-            if metric in self._timers:
-                duration = time.time() - self._timers.pop(metric)
-                self.observe(metric, duration)
-                return duration
-        return 0.0
+            start = self._timers.pop(metric, None)
+
+        if start is None:
+            return 0.0
+
+        duration = time.time() - start
+        self.observe(metric, duration)
+        return duration
 
     def snapshot(self) -> Dict:
         with self._lock:
