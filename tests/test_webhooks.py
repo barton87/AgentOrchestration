@@ -1,4 +1,4 @@
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -183,17 +183,28 @@ def test_410_gone_disables_endpoint_and_is_idempotent(monkeypatch):
     assert webhook.disabled_reason == "remote endpoint returned 410 Gone"
 
 
-def test_retryable_delivery_is_idempotent_for_same_event(monkeypatch):
+def test_retryable_delivery_reuses_event_record_but_allows_retry(monkeypatch):
     registry = WebhookRegistry()
     webhook = registry.register(endpoint())
     service = WebhookDeliveryService(registry)
-    calls = {"count": 0}
+    statuses = [http_error(503), None]
 
-    def unavailable_once(*args, **kwargs):
-        calls["count"] += 1
-        raise http_error(503)
+    class Response:
+        status = 204
 
-    monkeypatch.setattr("src.api.webhooks.urlopen", unavailable_once)
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def unavailable_then_success(*args, **kwargs):
+        next_status = statuses.pop(0)
+        if next_status is not None:
+            raise next_status
+        return Response()
+
+    monkeypatch.setattr("src.api.webhooks.urlopen", unavailable_then_success)
 
     first = service.deliver(
         workspace_id="workspace-a",
@@ -207,10 +218,38 @@ def test_retryable_delivery_is_idempotent_for_same_event(monkeypatch):
         event_id="event-retry-idempotent",
         payload={"value": 1},
     )
+    third = service.deliver(
+        workspace_id="workspace-a",
+        endpoint_id="endpoint-1",
+        event_id="event-retry-idempotent",
+        payload={"value": 1},
+    )
 
     assert first.status == WebhookDeliveryStatus.RETRYABLE
-    assert second == first
-    assert calls["count"] == 1
+    assert second.status == WebhookDeliveryStatus.DELIVERED
+    assert third == second
+    assert statuses == []
+    assert webhook.delivery_attempts["event-retry-idempotent"] == second
+    assert webhook.status == WebhookEndpointStatus.ACTIVE
+
+
+def test_transport_errors_are_recorded_as_retryable(monkeypatch):
+    registry = WebhookRegistry()
+    webhook = registry.register(endpoint())
+    service = WebhookDeliveryService(registry)
+
+    monkeypatch.setattr("src.api.webhooks.urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(URLError("dns failure")))
+
+    result = service.deliver(
+        workspace_id="workspace-a",
+        endpoint_id="endpoint-1",
+        event_id="event-transport-error",
+        payload={"value": 1},
+    )
+
+    assert result.status == WebhookDeliveryStatus.RETRYABLE
+    assert "transport error" in result.reason
+    assert webhook.delivery_attempts["event-transport-error"] == result
     assert webhook.status == WebhookEndpointStatus.ACTIVE
 
 

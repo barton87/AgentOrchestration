@@ -5,8 +5,8 @@ import hmac
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Iterable, Optional, Set
-from urllib.error import HTTPError
+from typing import Any, Dict, Optional, Set
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -111,7 +111,12 @@ class WebhookDeliveryService:
             return WebhookDeliveryResult(WebhookDeliveryStatus.REJECTED, reason="endpoint not found for workspace")
 
         previous = endpoint.delivery_attempts.get(event_id)
-        if previous:
+        if previous and previous.status in {
+            WebhookDeliveryStatus.DELIVERED,
+            WebhookDeliveryStatus.DISABLED,
+            WebhookDeliveryStatus.REJECTED,
+            WebhookDeliveryStatus.FAILED,
+        }:
             return previous
 
         if endpoint.status == WebhookEndpointStatus.DISABLED:
@@ -143,6 +148,11 @@ class WebhookDeliveryService:
                 result = self._result_for_status(response.status, endpoint)
         except HTTPError as error:
             result = self._result_for_status(error.code, endpoint)
+        except (URLError, TimeoutError, OSError) as error:
+            result = WebhookDeliveryResult(
+                WebhookDeliveryStatus.RETRYABLE,
+                reason=f"transport error during webhook delivery: {error.__class__.__name__}",
+            )
 
         endpoint.delivery_attempts[event_id] = result
         return result
