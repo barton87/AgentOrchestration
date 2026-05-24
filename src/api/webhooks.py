@@ -5,7 +5,7 @@ import hmac
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Set
 from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -24,6 +24,10 @@ class WebhookDeliveryStatus(str, Enum):
     FAILED = "failed"
 
 
+class WebhookValidationError(ValueError):
+    """Raised when webhook configuration or delivery input fails closed."""
+
+
 @dataclass
 class WebhookEndpoint:
     """A workspace-scoped outbound webhook endpoint."""
@@ -32,6 +36,8 @@ class WebhookEndpoint:
     workspace_id: str
     url: str
     secret: str
+    events: Set[str] = field(default_factory=set)
+    version: int = 1
     status: WebhookEndpointStatus = WebhookEndpointStatus.ACTIVE
     disabled_reason: Optional[str] = None
     delivery_attempts: Dict[str, "WebhookDeliveryResult"] = field(default_factory=dict)
@@ -63,19 +69,20 @@ class WebhookRegistry:
 
     def disable(self, endpoint: WebhookEndpoint, reason: str) -> None:
         endpoint.status = WebhookEndpointStatus.DISABLED
+        endpoint.version += 1
         endpoint.disabled_reason = reason
 
     @staticmethod
     def _validate_endpoint(endpoint: WebhookEndpoint) -> None:
         if not endpoint.id:
-            raise ValueError("webhook endpoint id is required")
+            raise WebhookValidationError("webhook endpoint id is required")
         if not endpoint.workspace_id:
-            raise ValueError("webhook workspace id is required")
+            raise WebhookValidationError("webhook workspace id is required")
         if not endpoint.secret:
-            raise ValueError("webhook secret is required")
+            raise WebhookValidationError("webhook secret is required")
         parsed = urlparse(endpoint.url)
         if parsed.scheme != "https" or not parsed.netloc:
-            raise ValueError("webhook endpoint url must be an absolute https URL")
+            raise WebhookValidationError("webhook endpoint url must be an absolute https URL")
 
 
 class WebhookDeliveryService:
@@ -94,9 +101,10 @@ class WebhookDeliveryService:
         endpoint_id: str,
         event_id: str,
         payload: Dict[str, Any],
+        event_type: Optional[str] = None,
     ) -> WebhookDeliveryResult:
         if not event_id:
-            raise ValueError("webhook event id is required")
+            raise WebhookValidationError("webhook event id is required")
 
         endpoint = self.registry.get(endpoint_id, workspace_id)
         if endpoint is None:
@@ -107,15 +115,24 @@ class WebhookDeliveryService:
             return previous
 
         if endpoint.status == WebhookEndpointStatus.DISABLED:
-            return WebhookDeliveryResult(WebhookDeliveryStatus.DISABLED, reason=endpoint.disabled_reason or "endpoint disabled")
+            result = WebhookDeliveryResult(WebhookDeliveryStatus.DISABLED, reason=endpoint.disabled_reason or "endpoint disabled")
+            endpoint.delivery_attempts[event_id] = result
+            return result
 
-        body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        if event_type and endpoint.events and event_type not in endpoint.events:
+            result = WebhookDeliveryResult(WebhookDeliveryStatus.REJECTED, reason="event type not subscribed for endpoint")
+            endpoint.delivery_attempts[event_id] = result
+            return result
+
+        public_payload = self._public_payload(payload)
+        body = json.dumps(public_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
         request = Request(
             endpoint.url,
             data=body,
             headers={
                 "Content-Type": "application/json",
                 "X-AO-Event-Id": event_id,
+                "X-AO-Endpoint-Version": str(endpoint.version),
                 "X-AO-Signature": self._signature(endpoint.secret, body),
             },
             method="POST",
@@ -129,6 +146,10 @@ class WebhookDeliveryService:
 
         endpoint.delivery_attempts[event_id] = result
         return result
+
+    @staticmethod
+    def _public_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {key: value for key, value in payload.items() if not key.startswith("internal_") and key not in {"workspace_id", "endpoint_id", "secret"}}
 
     def _result_for_status(self, status_code: int, endpoint: WebhookEndpoint) -> WebhookDeliveryResult:
         if 200 <= status_code < 300:
@@ -157,4 +178,5 @@ __all__ = [
     "WebhookEndpoint",
     "WebhookEndpointStatus",
     "WebhookRegistry",
+    "WebhookValidationError",
 ]

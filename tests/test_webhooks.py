@@ -8,6 +8,7 @@ from src.api.webhooks import (
     WebhookEndpoint,
     WebhookEndpointStatus,
     WebhookRegistry,
+    WebhookValidationError,
 )
 
 
@@ -33,7 +34,7 @@ def http_error(status_code):
 def test_register_rejects_non_https_endpoint():
     registry = WebhookRegistry()
 
-    with pytest.raises(ValueError, match="absolute https"):
+    with pytest.raises(WebhookValidationError, match="absolute https"):
         registry.register(WebhookEndpoint("endpoint-1", "workspace-a", "http://example.test/hook", "secret"))
 
 
@@ -87,14 +88,65 @@ def test_valid_delivery_sends_signed_json_request(monkeypatch):
         workspace_id="workspace-a",
         endpoint_id="endpoint-1",
         event_id="event-1",
-        payload={"value": 1},
+        event_type="run.completed",
+        payload={
+            "value": 1,
+            "internal_trace_id": "trace-secret",
+            "workspace_id": "workspace-a",
+            "endpoint_id": "endpoint-1",
+        },
     )
 
     assert result.status == WebhookDeliveryStatus.DELIVERED
     assert captured["method"] == "POST"
     assert captured["body"] == b'{"value":1}'
     assert captured["headers"]["X-ao-event-id"] == "event-1"
+    assert captured["headers"]["X-ao-endpoint-version"] == "1"
     assert captured["headers"]["X-ao-signature"].startswith("sha256=")
+
+
+def test_delivery_rejects_unsubscribed_event_without_network_call(monkeypatch):
+    registry = WebhookRegistry()
+    registry.register(WebhookEndpoint("endpoint-1", "workspace-a", "https://example.test/webhooks/agent", "secret", events={"run.completed"}))
+    service = WebhookDeliveryService(registry)
+
+    def fail_urlopen(*args, **kwargs):
+        raise AssertionError("unsubscribed delivery must fail before urlopen")
+
+    monkeypatch.setattr("src.api.webhooks.urlopen", fail_urlopen)
+
+    result = service.deliver(
+        workspace_id="workspace-a",
+        endpoint_id="endpoint-1",
+        event_id="event-filtered",
+        event_type="run.failed",
+        payload={"value": 1},
+    )
+
+    assert result.status == WebhookDeliveryStatus.REJECTED
+    assert "not subscribed" in result.reason
+
+
+def test_delivery_to_disabled_endpoint_records_terminal_attempt_without_network_call(monkeypatch):
+    registry = WebhookRegistry()
+    webhook = registry.register(endpoint())
+    registry.disable(webhook, "rotated endpoint")
+    service = WebhookDeliveryService(registry)
+
+    def fail_urlopen(*args, **kwargs):
+        raise AssertionError("disabled endpoint must fail before urlopen")
+
+    monkeypatch.setattr("src.api.webhooks.urlopen", fail_urlopen)
+
+    result = service.deliver(
+        workspace_id="workspace-a",
+        endpoint_id="endpoint-1",
+        event_id="event-disabled",
+        payload={"value": 1},
+    )
+
+    assert result.status == WebhookDeliveryStatus.DISABLED
+    assert webhook.delivery_attempts["event-disabled"] == result
 
 
 def test_410_gone_disables_endpoint_and_is_idempotent(monkeypatch):
@@ -127,6 +179,7 @@ def test_410_gone_disables_endpoint_and_is_idempotent(monkeypatch):
     assert second == first
     assert calls["count"] == 1
     assert webhook.status == WebhookEndpointStatus.DISABLED
+    assert webhook.version == 2
     assert webhook.disabled_reason == "remote endpoint returned 410 Gone"
 
 
