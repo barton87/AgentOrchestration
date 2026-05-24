@@ -111,7 +111,7 @@ class WebhookDeliveryService:
             return WebhookDeliveryResult(WebhookDeliveryStatus.REJECTED, reason="endpoint not found for workspace")
 
         previous = endpoint.delivery_attempts.get(event_id)
-        if previous and previous.status in {WebhookDeliveryStatus.DELIVERED, WebhookDeliveryStatus.DISABLED}:
+        if previous:
             return previous
 
         if endpoint.status == WebhookEndpointStatus.DISABLED:

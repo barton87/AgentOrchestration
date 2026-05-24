@@ -183,6 +183,37 @@ def test_410_gone_disables_endpoint_and_is_idempotent(monkeypatch):
     assert webhook.disabled_reason == "remote endpoint returned 410 Gone"
 
 
+def test_retryable_delivery_is_idempotent_for_same_event(monkeypatch):
+    registry = WebhookRegistry()
+    webhook = registry.register(endpoint())
+    service = WebhookDeliveryService(registry)
+    calls = {"count": 0}
+
+    def unavailable_once(*args, **kwargs):
+        calls["count"] += 1
+        raise http_error(503)
+
+    monkeypatch.setattr("src.api.webhooks.urlopen", unavailable_once)
+
+    first = service.deliver(
+        workspace_id="workspace-a",
+        endpoint_id="endpoint-1",
+        event_id="event-retry-idempotent",
+        payload={"value": 1},
+    )
+    second = service.deliver(
+        workspace_id="workspace-a",
+        endpoint_id="endpoint-1",
+        event_id="event-retry-idempotent",
+        payload={"value": 1},
+    )
+
+    assert first.status == WebhookDeliveryStatus.RETRYABLE
+    assert second == first
+    assert calls["count"] == 1
+    assert webhook.status == WebhookEndpointStatus.ACTIVE
+
+
 def test_retryable_status_does_not_disable_endpoint(monkeypatch):
     registry = WebhookRegistry()
     webhook = registry.register(endpoint())
